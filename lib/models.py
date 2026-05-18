@@ -274,6 +274,7 @@ def _call_claude_cli(model_id: str, system: str, messages: list[dict]) -> str:
 
 
 def _call_codex_cli(model_id: str, system: str, messages: list[dict]) -> str:
+    import tempfile, os as _os
     parts = []
     if system:
         parts.append(system)
@@ -281,12 +282,32 @@ def _call_codex_cli(model_id: str, system: str, messages: list[dict]) -> str:
         if m["role"] == "user":
             parts.append(m["content"])
     prompt = "\n\n".join(parts)
-    result = subprocess.run(
-        ["codex", "-q", prompt],
-        capture_output=True, text=True, timeout=120,
-        stdin=subprocess.DEVNULL,
-    )
-    return result.stdout.strip()
+
+    out_fd, out_path = tempfile.mkstemp(suffix=".txt")
+    _os.close(out_fd)
+    try:
+        cmd = [
+            "codex", "exec",
+            "--skip-git-repo-check",
+            "--full-auto",
+            "--output-last-message", out_path,
+        ]
+        if model_id:
+            cmd += ["-c", f'model="{model_id}"']
+        cmd.append(prompt)
+
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+            stdin=subprocess.DEVNULL, cwd="/tmp",
+        )
+        output = open(out_path).read().strip()
+        if output:
+            return output
+        if result.returncode != 0 and result.stderr:
+            raise RuntimeError(result.stderr[:300])
+        return result.stdout.strip()
+    finally:
+        _os.unlink(out_path)
 
 
 def _call_gemini_cli(model_id: str, system: str, messages: list[dict]) -> str:
