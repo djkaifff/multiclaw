@@ -129,6 +129,11 @@ def _create_bot_wizard(bot_name: str = None):
     wt_cfg = _setup_websearch_wizard()
     cfg["webtools"] = wt_cfg
 
+    # Step 4: Skills
+    print("\n\033[1m=== Шаг 4: Скиллы ===\033[0m\n")
+    skills_cfg = _setup_skills_wizard()
+    cfg["skills"] = skills_cfg
+
     state.save_config(bot_name, cfg)
     _print_summary(bot_name, cfg)
 
@@ -151,16 +156,17 @@ def _edit_bot_wizard(bot_name: str):
     action = questionary.select(
         "Что настроить?",
         choices=[
-            questionary.Choice("  Модель",          value="model"),
-            questionary.Choice("  Канал связи",     value="channel"),
-            questionary.Choice("  Web Search",      value="websearch"),
-            questionary.Choice("  Soul (личность)", value="soul"),
-            questionary.Choice("  Heartbeat (CRON)","value", value="heartbeat"),
+            questionary.Choice("  Модель",           value="model"),
+            questionary.Choice("  Канал связи",      value="channel"),
+            questionary.Choice("  Web Search",       value="websearch"),
+            questionary.Choice("  Скиллы",           value="skills"),
+            questionary.Choice("  Soul (личность)",  value="soul"),
+            questionary.Choice("  Heartbeat (CRON)", value="heartbeat"),
             questionary.Separator(),
             questionary.Choice("  ▶ Запустить бота", value="start"),
-            questionary.Choice("  ■ Остановить бота","value", value="stop"),
+            questionary.Choice("  ■ Остановить бота",value="stop"),
             questionary.Separator(),
-            questionary.Choice("  ← Назад", value="back"),
+            questionary.Choice("  ← Назад",          value="back"),
         ],
         style=STYLE,
     ).ask()
@@ -184,6 +190,12 @@ def _edit_bot_wizard(bot_name: str):
         cfg["webtools"] = wt_cfg
         state.save_config(bot_name, cfg)
         print("  ✓ Web search сохранён.\n")
+
+    elif action == "skills":
+        skills_cfg = _setup_skills_wizard()
+        cfg["skills"] = skills_cfg
+        state.save_config(bot_name, cfg)
+        print("  ✓ Скиллы сохранены.\n")
 
     elif action == "soul":
         _edit_soul(bot_name)
@@ -332,12 +344,18 @@ def _setup_model_wizard(bot_name: str) -> dict | None:
 # ── Channel setup wizard ─────────────────────────────────────────────
 
 def _setup_channel_wizard() -> dict | None:
+    from lib.channels import HAS_DISCORD, HAS_SLACK
+
+    discord_note = "" if HAS_DISCORD else "  [pip install discord.py]"
+    slack_note   = "" if HAS_SLACK   else "  [pip install slack-bolt slack-sdk]"
+
     channel_type = questionary.select(
         "Тип канала:",
         choices=[
-            questionary.Choice("  Telegram",        value="telegram"),
-            questionary.Choice("  Discord (скоро)", value=None),
-            questionary.Choice("  ← Пропустить",    value=None),
+            questionary.Choice("  Telegram",                   value="telegram"),
+            questionary.Choice(f"  Discord{discord_note}",     value="discord"),
+            questionary.Choice(f"  Slack{slack_note}",         value="slack"),
+            questionary.Choice("  ← Пропустить",               value=None),
         ],
         style=STYLE,
     ).ask()
@@ -347,6 +365,10 @@ def _setup_channel_wizard() -> dict | None:
 
     if channel_type == "telegram":
         return _setup_telegram()
+    elif channel_type == "discord":
+        return _setup_discord()
+    elif channel_type == "slack":
+        return _setup_slack()
 
     return None
 
@@ -389,6 +411,181 @@ def _build_telegram_config(token: str, username: str) -> dict:
             except ValueError:
                 print("  ⚠ Неверный формат, пропускаю.")
     return cfg
+
+
+def _setup_discord() -> dict | None:
+    print("\n  Нужен бот в Discord Developer Portal:")
+    print("  1. discord.com/developers/applications → New Application")
+    print("  2. Bot → Add Bot → Copy Token")
+    print("  3. Bot → Privileged Gateway Intents → Message Content Intent ✓")
+    print("  4. OAuth2 → URL Generator → bot + Send Messages + Read Message History\n")
+
+    token = questionary.password("Discord Bot Token:", style=STYLE).ask()
+    if not token:
+        return None
+    token = token.strip()
+
+    print("  Проверяю токен...", end="", flush=True)
+    from lib.channels import test_discord_token
+    ok, info = test_discord_token(token)
+    if ok:
+        print(f" \033[32m✓ {info}\033[0m")
+    else:
+        print(f" \033[31m✗ {info}\033[0m")
+        return None
+
+    allow_all = questionary.confirm(
+        "Принимать сообщения из любых каналов?", default=True, style=STYLE
+    ).ask()
+    cfg: dict = {"type": "discord", "token": token, "username": info}
+    if not allow_all:
+        ch_ids = questionary.text(
+            "ID каналов через запятую (числа):", style=STYLE
+        ).ask()
+        if ch_ids:
+            try:
+                cfg["allowed_channels"] = [int(x.strip()) for x in ch_ids.split(",")]
+            except ValueError:
+                print("  ⚠ Неверный формат, пропускаю.")
+    return cfg
+
+
+def _setup_slack() -> dict | None:
+    print("\n  Нужно Slack App с Socket Mode:")
+    print("  1. api.slack.com/apps → Create New App → From Scratch")
+    print("  2. Socket Mode → Enable Socket Mode → App-Level Token (scope: connections:write) → xapp-...")
+    print("  3. OAuth & Permissions → Bot Token Scopes: chat:write, channels:history, im:history")
+    print("  4. Event Subscriptions → Subscribe to bot events: message.channels, message.im")
+    print("  5. Install to Workspace → Bot Token (xoxb-...)\n")
+
+    bot_token = questionary.password("Slack Bot Token (xoxb-...):", style=STYLE).ask()
+    if not bot_token:
+        return None
+
+    print("  Проверяю bot token...", end="", flush=True)
+    from lib.channels import test_slack_token
+    ok, info = test_slack_token(bot_token.strip())
+    if ok:
+        print(f" \033[32m✓ {info}\033[0m")
+    else:
+        print(f" \033[31m✗ {info}\033[0m")
+        return None
+
+    app_token = questionary.password("Slack App-Level Token (xapp-...):", style=STYLE).ask()
+    if not app_token:
+        return None
+
+    allow_all = questionary.confirm(
+        "Принимать сообщения из любых каналов?", default=True, style=STYLE
+    ).ask()
+    cfg: dict = {"type": "slack", "bot_token": bot_token.strip(),
+                 "app_token": app_token.strip(), "workspace": info}
+    if not allow_all:
+        ch_ids = questionary.text(
+            "ID каналов через запятую (C01ABC...):", style=STYLE
+        ).ask()
+        if ch_ids:
+            cfg["allowed_channels"] = [x.strip() for x in ch_ids.split(",")]
+    return cfg
+
+
+# ── Skills wizard ─────────────────────────────────────────────────────
+
+def _setup_skills_wizard() -> dict:
+    from lib.skills import BUILTIN_SKILLS
+
+    # web-search is configured separately in webtools wizard
+    configurable = {k: v for k, v in BUILTIN_SKILLS.items() if k != "web-search"}
+
+    skill_choices = [
+        questionary.Choice(
+            title=f"  {sid:<14} {desc.split(' — ')[0]}",
+            value=sid,
+        )
+        for sid, desc in configurable.items()
+    ]
+
+    enabled = questionary.checkbox(
+        "Выбери скиллы (пробел = вкл/выкл, Enter = готово):",
+        choices=skill_choices,
+        style=STYLE,
+    ).ask() or []
+
+    skills_cfg: dict = {"_enabled": enabled}
+
+    if "github" in enabled:
+        token = questionary.password(
+            "GitHub Token (необязательно, для приватных репо):", style=STYLE
+        ).ask()
+        skills_cfg["github"] = {"github_token": (token or "").strip()}
+
+    if "notion" in enabled:
+        print("  Создай интеграцию: notion.so/my-integrations → New integration → Copy token")
+        token = questionary.password("Notion Integration Token:", style=STYLE).ask()
+        skills_cfg["notion"] = {"notion_token": (token or "").strip()}
+
+    if "trello" in enabled:
+        print("  Ключ и токен: trello.com/app-key")
+        key = questionary.password("Trello API Key:", style=STYLE).ask()
+        tok = questionary.password("Trello Token:", style=STYLE).ask()
+        skills_cfg["trello"] = {
+            "trello_key":   (key or "").strip(),
+            "trello_token": (tok or "").strip(),
+        }
+
+    if "obsidian" in enabled:
+        vault = questionary.text(
+            "Путь к Obsidian vault (например ~/Documents/MyVault):", style=STYLE
+        ).ask()
+        skills_cfg["obsidian"] = {"obsidian_vault": (vault or "").strip()}
+
+    if "email" in enabled:
+        provider = questionary.select(
+            "Email провайдер:",
+            choices=[
+                questionary.Choice("  SMTP (Gmail, Yandex, Mail.ru...)", value="smtp"),
+                questionary.Choice("  himalaya CLI", value="himalaya"),
+            ],
+            style=STYLE,
+        ).ask()
+        if provider == "smtp":
+            host = questionary.text("SMTP Host:", default="smtp.gmail.com", style=STYLE).ask()
+            port = questionary.text("SMTP Port:", default="587", style=STYLE).ask()
+            user = questionary.text("Email адрес:", style=STYLE).ask()
+            pwd  = questionary.password("Пароль / App Password:", style=STYLE).ask()
+            skills_cfg["email"] = {
+                "smtp_host": (host or "smtp.gmail.com").strip(),
+                "smtp_port": int(port or 587),
+                "smtp_user": (user or "").strip(),
+                "smtp_pass": (pwd  or "").strip(),
+            }
+        else:
+            skills_cfg["email"] = {"provider": "himalaya"}
+
+    if enabled:
+        print(f"\n  ✓ Включены скиллы: {', '.join(enabled)}\n")
+        _print_skill_hints(enabled)
+
+    return skills_cfg
+
+
+def _print_skill_hints(enabled: list[str]):
+    hints = {
+        "web-fetch":   "/fetch <url>",
+        "summarize":   "/summarize <url или текст>",
+        "github":      "/github owner/repo [open|closed]",
+        "notion":      "/notion <поисковый запрос>",
+        "trello":      "/trello [название доски]",
+        "obsidian":    "/note <название заметки>",
+        "tmux":        "/run <shell команда>",
+        "email":       "/email to@mail.ru Тема: Текст",
+        "code-runner": "/code print('hello')",
+    }
+    print("  Команды в чате:")
+    for sid in enabled:
+        if sid in hints:
+            print(f"    {hints[sid]}")
+    print()
 
 
 # ── Web search wizard ────────────────────────────────────────────────
@@ -566,4 +763,7 @@ def _print_summary(bot_name: str, cfg: dict):
 
     wt = cfg.get("webtools", {})
     print(f"  Web Search: {'✓ ' + wt.get('provider','') if wt.get('enabled') else '○ выключен'}")
+
+    sk = cfg.get("skills", {}).get("_enabled", [])
+    print(f"  Скиллы   : {', '.join(sk) if sk else '○ не выбраны'}")
     print()

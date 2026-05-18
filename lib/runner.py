@@ -1,19 +1,20 @@
 """
 Bot runner — main loop. Called by `multiclaw run <name>`.
-Polls channel → calls model → sends response → updates context & backups.
+Polls channel → dispatches skills or calls model → sends response.
+Supports Telegram, Discord, Slack via unified channel interface.
 """
 import os
-import sys
 import time
 import signal
 from datetime import datetime, timezone
 from lib.state import (
     get_config, get_soul, get_context, append_context,
-    save_backup, agent_dir
+    save_backup, agent_dir,
 )
 from lib.models import call_model
-from lib.channels import TelegramChannel
+from lib.channels import create_channel
 from lib.webtools import search, format_results
+from lib import skills as skills_lib
 
 CONTEXT_SYSTEM = """
 Ниже — краткий лог твоих недавних действий и диалогов.
@@ -22,7 +23,7 @@ CONTEXT_SYSTEM = """
 {context}
 """
 
-SEARCH_TRIGGER = ["/search ", "/поиск ", "/web "]
+SEARCH_TRIGGERS = ["/search ", "/поиск ", "/web "]
 
 
 class BotRunner:
@@ -31,33 +32,36 @@ class BotRunner:
         self.cfg  = get_config(name)
         self._validate()
 
-        channel_cfg = self.cfg["channel"]
-        allowed     = channel_cfg.get("allowed_chats")
-        self.channel = TelegramChannel(
-            token=channel_cfg["token"],
-            allowed_chats=allowed if isinstance(allowed, list) else None,
-        )
-        self.model_cfg = self.cfg["model"]
-        self.webtools  = self.cfg.get("webtools", {})
+        self.channel    = create_channel(self.cfg["channel"])
+        self.model_cfg  = self.cfg["model"]
+        self.webtools   = self.cfg.get("webtools", {})
 
         self._running = True
         signal.signal(signal.SIGTERM, self._handle_stop)
         signal.signal(signal.SIGINT,  self._handle_stop)
 
-        pid_file = agent_dir(name) / "bot.pid"
-        pid_file.write_text(str(os.getpid()))
+        (agent_dir(name) / "bot.pid").write_text(str(os.getpid()))
 
     def _validate(self):
         if not self.cfg.get("model", {}).get("api_key"):
             raise RuntimeError(f"Бот '{self.name}': модель не настроена")
-        if not self.cfg.get("channel", {}).get("token"):
+        ch = self.cfg.get("channel", {})
+        if not ch:
             raise RuntimeError(f"Бот '{self.name}': канал не настроен")
+        ch_type = ch.get("type", "telegram")
+        if ch_type == "telegram" and not ch.get("token"):
+            raise RuntimeError(f"Бот '{self.name}': Telegram token не указан")
+        elif ch_type == "discord" and not ch.get("token"):
+            raise RuntimeError(f"Бот '{self.name}': Discord token не указан")
+        elif ch_type == "slack" and (not ch.get("bot_token") or not ch.get("app_token")):
+            raise RuntimeError(f"Бот '{self.name}': Slack bot_token и app_token обязательны")
 
     def _handle_stop(self, *_):
         self._running = False
 
     def run(self):
-        print(f"[{self.name}] Запущен. Модель: {self.model_cfg.get('model_id')}")
+        ch_type = self.cfg["channel"].get("type", "telegram")
+        print(f"[{self.name}] Запущен. Канал: {ch_type}. Модель: {self.model_cfg.get('model_id')}")
         while self._running:
             try:
                 messages = self.channel.poll(timeout=25)
@@ -67,77 +71,82 @@ class BotRunner:
                 print(f"[{self.name}] Ошибка: {e}")
                 time.sleep(5)
 
-        pid_file = agent_dir(self.name) / "bot.pid"
-        pid_file.unlink(missing_ok=True)
+        (agent_dir(self.name) / "bot.pid").unlink(missing_ok=True)
         print(f"[{self.name}] Остановлен.")
 
     def _handle_message(self, msg: dict):
-        text     = msg["text"].strip()
-        chat_id  = msg["chat_id"]
-        msg_id   = msg["message_id"]
-        user     = msg["user"]
+        text    = msg["text"].strip()
+        chat_id = msg["chat_id"]
+        msg_id  = msg["message_id"]
+        user    = msg["user"]
 
         self.channel.send_typing(chat_id)
 
-        # Web search command
+        # ── Skill triggers (/github, /notion, /fetch, ...) ────────────
+        for trigger in skills_lib.SKILL_TRIGGERS:
+            if text.lower().startswith(trigger):
+                args   = text[len(trigger):].strip()
+                result = skills_lib.dispatch_skill(
+                    trigger, args, self.cfg, self.model_cfg, get_soul(self.name)
+                )
+                if result:
+                    self.channel.send(chat_id, result, reply_to=msg_id)
+                    self._log(user, text, result)
+                    return
+
+        # ── Web search (/search, /поиск, /web) ───────────────────────
         if self.webtools.get("enabled"):
-            for trigger in SEARCH_TRIGGER:
+            for trigger in SEARCH_TRIGGERS:
                 if text.lower().startswith(trigger):
                     query = text[len(trigger):].strip()
                     self._handle_search(chat_id, msg_id, query)
                     return
 
-        # Normal AI response
+        # ── Normal AI response ────────────────────────────────────────
         response = self._call_ai(text, user)
-
         self.channel.send(chat_id, response, reply_to=msg_id)
-
-        # Update context log
-        ts = datetime.now(timezone.utc).strftime("%m-%d %H:%M")
-        entry = f"[{ts}] {user}: {text[:80]}\n[{ts}] bot: {response[:120]}"
-        append_context(self.name, entry)
-
-        # Save backup
-        save_backup(self.name, {
-            "ts":       datetime.now(timezone.utc).isoformat(),
-            "chat_id":  chat_id,
-            "user":     user,
-            "input":    text,
-            "output":   response[:500],
-        })
+        self._log(user, text, response)
 
     def _call_ai(self, user_text: str, user: str) -> str:
         soul    = get_soul(self.name)
         context = get_context(self.name)
-
-        system = soul
+        system  = soul
         if context.strip():
             system += "\n\n" + CONTEXT_SYSTEM.format(context=context[-3000:])
-
-        messages = [{"role": "user", "content": user_text}]
         try:
-            return call_model(self.model_cfg, messages, system=system)
+            return call_model(self.model_cfg,
+                              [{"role": "user", "content": user_text}],
+                              system=system)
         except Exception as e:
             return f"⚠️ Ошибка модели: {e}"
 
-    def _handle_search(self, chat_id: int, msg_id: int, query: str):
+    def _handle_search(self, chat_id, msg_id, query: str):
         if not query:
-            self.channel.send(chat_id, "Укажи поисковый запрос: /search <запрос>")
+            self.channel.send(chat_id, "Укажи запрос: /search <запрос>")
             return
-        results = search(query, self.webtools)
+        results   = search(query, self.webtools)
         formatted = format_results(results)
-        # Ask AI to summarize results
-        soul = get_soul(self.name)
-        prompt = f"Пользователь ищет: {query}\n\nРезультаты поиска:\n{formatted}\n\nДай краткий ответ на основе этих данных."
+        soul      = get_soul(self.name)
+        prompt    = (f"Пользователь ищет: {query}\n\nРезультаты поиска:\n{formatted}\n\n"
+                     "Дай краткий ответ на основе этих данных.")
         try:
-            response = call_model(
-                self.model_cfg,
-                [{"role": "user", "content": prompt}],
-                system=soul,
-            )
-        except Exception as e:
+            response = call_model(self.model_cfg,
+                                  [{"role": "user", "content": prompt}],
+                                  system=soul)
+        except Exception:
             response = f"Результаты поиска:\n{formatted}"
         self.channel.send(chat_id, response, reply_to=msg_id)
+
+    def _log(self, user: str, inp: str, out: str):
+        ts    = datetime.now(timezone.utc).strftime("%m-%d %H:%M")
+        entry = f"[{ts}] {user}: {inp[:80]}\n[{ts}] bot: {out[:120]}"
+        append_context(self.name, entry)
+        save_backup(self.name, {
+            "ts":      datetime.now(timezone.utc).isoformat(),
+            "user":    user,
+            "input":   inp,
+            "output":  out[:500],
+        })
 
 
 def run_bot(name: str):

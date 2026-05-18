@@ -1,2 +1,6 @@
 questionary>=2.0.0
 requests>=2.31.0
+# Optional — install only if you use these channels/skills:
+# discord.py>=2.3.0
+# slack-bolt>=1.18.0
+# slack-sdk>=3.26.0
