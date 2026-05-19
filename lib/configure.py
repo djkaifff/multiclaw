@@ -33,8 +33,21 @@ def run():
     print(BANNER)
 
     while True:
+        from lib.codex_auth import is_codex_logged_in, codex_login_status
         agents = state.get_agents()
         _print_bots(agents)
+
+        _logged_in = is_codex_logged_in()
+        if _logged_in:
+            _codex_item = questionary.Choice(
+                f"  ● Codex CLI  [{codex_login_status()}]",
+                value="codex_login",
+            )
+        else:
+            _codex_item = questionary.Choice(
+                "  \033[33m⚠ Codex CLI — не авторизован  [войти]\033[0m",
+                value="codex_login",
+            )
 
         choices = []
         if agents:
@@ -48,6 +61,8 @@ def run():
         choices += [
             questionary.Choice("  + Создать нового бота", value="new"),
             questionary.Choice("  × Удалить бота",        value="delete") if agents else None,
+            questionary.Separator(),
+            _codex_item,
             questionary.Separator(),
             questionary.Choice("  q Выйти",               value="quit"),
         ]
@@ -65,6 +80,8 @@ def run():
             _create_bot_wizard()
         elif action == "delete":
             _delete_bot_wizard(agents)
+        elif action == "codex_login":
+            _run_codex_login_wizard()
         elif action and action.startswith("edit:"):
             name = action.split(":", 1)[1]
             _edit_bot_wizard(name)
@@ -153,9 +170,11 @@ def _edit_bot_wizard(bot_name: str):
 
     cfg = state.get_config(bot_name)
 
-    from lib.codex_auth import codex_login_status as _cls
-    _codex_status = _cls()
-    _codex_label  = f"  Codex CLI авторизация  [{_codex_status}]"
+    from lib.codex_auth import is_codex_logged_in as _cok, codex_login_status as _cls
+    if _cok():
+        _codex_label = f"  ● Codex CLI  [{_cls()}]"
+    else:
+        _codex_label = "  ⚠ Codex CLI — не авторизован  [войти]"
 
     action = questionary.select(
         "Что настроить?",
@@ -225,13 +244,19 @@ def _setup_model_wizard(bot_name: str) -> dict | None:
 
     provider_choices = []
 
+    from lib.codex_auth import is_codex_logged_in as _codex_ok
+
     # Available providers first (CLI tools or detected API keys)
     if available:
         print("  Обнаружены доступные провайдеры:")
         for p in available:
             is_cli = p.get("api_type", "") in ("claude-cli", "codex-cli", "gemini-cli")
             if is_cli:
-                label = f"  ● {p['name']:<22} (CLI, ключ не нужен)"
+                if p.get("api_type") == "codex-cli":
+                    auth_note = "✓ авторизован" if _codex_ok() else "⚠ не авторизован"
+                    label = f"  ● {p['name']:<22} (CLI) {auth_note}"
+                else:
+                    label = f"  ● {p['name']:<22} (CLI, ключ не нужен)"
             else:
                 key = p.get("api_key", "")
                 key_preview = key[:12] + "..." if len(key) > 12 else key
@@ -249,8 +274,13 @@ def _setup_model_wizard(bot_name: str) -> dict | None:
 
     for pid, pdata in models.CLI_PROVIDERS.items():
         if pid not in found_ids:
+            if pdata.get("api_type") == "codex-cli":
+                auth_note = "✓ авторизован" if _codex_ok() else "⚠ не авторизован"
+                label = f"  ○ {pdata['name']:<22} (CLI) {auth_note}"
+            else:
+                label = f"  ○ {pdata['name']:<22} {pdata['description']}"
             provider_choices.append(questionary.Choice(
-                title=f"  ○ {pdata['name']:<22} {pdata['description']}",
+                title=label,
                 value={"type": "new_cli", "provider_id": pid, "data": pdata},
             ))
 
