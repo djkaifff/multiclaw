@@ -1,28 +1,32 @@
 """
-Codex CLI OAuth authentication via Device Code Flow (RFC 8628).
-Obtains access_token, refresh_token, id_token and stores them in
-~/.codex/auth.json — the same location the codex CLI reads.
+Codex CLI OAuth authentication — Authorization Code Flow with PKCE.
+Matches the flow OpenClaw uses: builds auth URL, user opens in browser,
+pastes redirect URL back (VPS mode) or local callback server catches it.
+Tokens saved to ~/.codex/auth.json.
 """
-import json
-import time
 import hashlib
 import base64
+import json
 import os
 import secrets
+import time
+import threading
+import urllib.parse
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 
-# ── OAuth constants (extracted from codex binary) ────────────────────
+# ── OAuth constants ───────────────────────────────────────────────────
 
 _AUTH_BASE    = "https://auth.openai.com"
-_DEVICE_URL   = f"{_AUTH_BASE}/oauth/device/code"
+_AUTH_URL     = f"{_AUTH_BASE}/oauth/authorize"
 _TOKEN_URL    = f"{_AUTH_BASE}/oauth/token"
 _REVOKE_URL   = f"{_AUTH_BASE}/oauth/revoke"
-_VERIFY_URL   = f"{_AUTH_BASE}/codex/device"   # human-friendly page
 
-_CLIENT_ID    = "app_EMoamEEZ73f0CkXaXp7hran"
-_SCOPES       = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+_CLIENT_ID    = "app_EMoamEEZ73f0CkXaXp7hrann"
+_REDIRECT_URI = "http://localhost:1455/auth/callback"
+_SCOPES       = "openid profile email offline_access"
 
 _CODEX_AUTH   = Path.home() / ".codex" / "auth.json"
 
@@ -30,7 +34,6 @@ _CODEX_AUTH   = Path.home() / ".codex" / "auth.json"
 # ── PKCE helpers ─────────────────────────────────────────────────────
 
 def _pkce_pair() -> tuple[str, str]:
-    """Returns (verifier, challenge) for PKCE S256."""
     verifier  = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
     challenge = base64.urlsafe_b64encode(
         hashlib.sha256(verifier.encode()).digest()
@@ -38,89 +41,111 @@ def _pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-# ── Device Code Flow ──────────────────────────────────────────────────
+# ── Build authorization URL ───────────────────────────────────────────
 
-def device_auth_start() -> dict:
+def build_auth_url() -> tuple[str, str, str]:
     """
-    Step 1 — request device+user code.
-    Returns dict with keys: device_code, user_code, verification_uri,
-    expires_in, interval.
-    Raises RuntimeError on failure.
+    Returns (auth_url, state, code_verifier).
+    auth_url: open this in the browser.
+    state, code_verifier: keep to verify the callback.
     """
     verifier, challenge = _pkce_pair()
+    state = secrets.token_hex(16)
 
+    params = {
+        "response_type":             "code",
+        "client_id":                 _CLIENT_ID,
+        "redirect_uri":              _REDIRECT_URI,
+        "scope":                     _SCOPES,
+        "code_challenge":            challenge,
+        "code_challenge_method":     "S256",
+        "state":                     state,
+        "id_token_add_organizations": "true",
+        "codex_cli_simplified_flow": "true",
+    }
+    url = _AUTH_URL + "?" + urllib.parse.urlencode(params)
+    return url, state, verifier
+
+
+# ── Exchange code for tokens ──────────────────────────────────────────
+
+def exchange_code(code: str, verifier: str) -> dict:
+    """
+    POST authorization code + PKCE verifier to token endpoint.
+    Returns tokens dict: {access_token, refresh_token, id_token, ...}.
+    """
     resp = requests.post(
-        _DEVICE_URL,
+        _TOKEN_URL,
         data={
-            "client_id":             _CLIENT_ID,
-            "scope":                 _SCOPES,
-            "code_challenge":        challenge,
-            "code_challenge_method": "S256",
+            "grant_type":    "authorization_code",
+            "client_id":     _CLIENT_ID,
+            "code":          code,
+            "redirect_uri":  _REDIRECT_URI,
+            "code_verifier": verifier,
         },
         timeout=15,
     )
     if not resp.ok:
-        raise RuntimeError(f"Device auth failed: {resp.status_code} {resp.text[:200]}")
-
+        raise RuntimeError(f"Token exchange failed: {resp.status_code} {resp.text[:200]}")
     data = resp.json()
-    data["_verifier"] = verifier   # carry verifier through to poll step
+    if "access_token" not in data:
+        raise RuntimeError(f"No access_token in response: {data}")
     return data
 
 
-def device_auth_poll(device_code: str, verifier: str,
-                     interval: int = 5, timeout: int = 300,
-                     on_waiting=None) -> dict:
+# ── Local callback server (works if browser is on same machine) ───────
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        self.server._code  = qs.get("code", [None])[0]
+        self.server._state = qs.get("state", [None])[0]
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"<h1>Done! Return to terminal.</h1>")
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    def log_message(self, *_):
+        pass
+
+
+def _try_local_server(timeout: int = 120) -> str | None:
     """
-    Step 2 — poll token endpoint until user approves or timeout.
-    on_waiting: optional callable(elapsed_seconds) called each polling tick.
-    Returns tokens dict: {access_token, refresh_token, id_token, ...}.
-    Raises RuntimeError on error or timeout.
+    Starts HTTP server on localhost:1455. Returns code if browser redirects
+    to it within timeout, or None if port is busy / no redirect received.
     """
+    try:
+        srv = HTTPServer(("127.0.0.1", 1455), _CallbackHandler)
+        srv._code  = None
+        srv._state = None
+        srv.timeout = 2  # poll interval
+    except OSError:
+        return None
+
     deadline = time.time() + timeout
-    wait     = max(interval, 3)
+    while time.time() < deadline and srv._code is None:
+        srv.handle_request()
 
-    while time.time() < deadline:
-        time.sleep(wait)
+    srv.server_close()
+    return srv._code
 
-        resp = requests.post(
-            _TOKEN_URL,
-            data={
-                "client_id":     _CLIENT_ID,
-                "device_code":   device_code,
-                "grant_type":    "urn:ietf:params:oauth:grant-type:device_code",
-                "code_verifier": verifier,
-            },
-            timeout=15,
-        )
-        data = resp.json()
 
-        error = data.get("error")
-        if error == "authorization_pending":
-            elapsed = int(timeout - (deadline - time.time()))
-            if on_waiting:
-                on_waiting(elapsed)
-            continue
-        elif error == "slow_down":
-            wait += 5
-            continue
-        elif error == "expired_token":
-            raise RuntimeError("Код подтверждения истёк. Запусти авторизацию заново.")
-        elif error == "access_denied":
-            raise RuntimeError("Авторизация отклонена пользователем.")
-        elif error:
-            raise RuntimeError(f"OAuth error: {error} — {data.get('error_description', '')}")
+# ── Parse redirect URL pasted by user ────────────────────────────────
 
-        # Success
-        if "access_token" in data:
-            return data
-
-    raise RuntimeError("Timeout: пользователь не подтвердил авторизацию вовремя.")
+def _parse_redirect_url(url: str) -> tuple[str, str]:
+    """Extract (code, state) from redirect URL."""
+    parsed = urllib.parse.urlparse(url.strip())
+    qs = urllib.parse.parse_qs(parsed.query)
+    code  = qs.get("code", [None])[0]
+    state = qs.get("state", [None])[0]
+    if not code:
+        raise ValueError("В URL нет параметра code.")
+    return code, state or ""
 
 
 # ── Token storage ─────────────────────────────────────────────────────
 
 def save_codex_auth(tokens: dict):
-    """Write tokens to ~/.codex/auth.json in the format codex CLI expects."""
     _CODEX_AUTH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "tokens": {
@@ -136,7 +161,6 @@ def save_codex_auth(tokens: dict):
 
 
 def load_codex_auth() -> dict | None:
-    """Read ~/.codex/auth.json. Returns None if missing or malformed."""
     try:
         return json.loads(_CODEX_AUTH.read_text())
     except Exception:
@@ -144,7 +168,6 @@ def load_codex_auth() -> dict | None:
 
 
 def is_codex_logged_in() -> bool:
-    """Quick check: auth.json exists and has a non-empty access_token."""
     auth = load_codex_auth()
     if not auth:
         return False
@@ -154,17 +177,12 @@ def is_codex_logged_in() -> bool:
 # ── Token refresh ─────────────────────────────────────────────────────
 
 def refresh_codex_token() -> bool:
-    """
-    Attempt to refresh access_token using refresh_token.
-    Returns True on success, False if refresh_token is missing/expired.
-    """
     auth = load_codex_auth()
     if not auth:
         return False
     refresh_token = auth.get("tokens", {}).get("refresh_token", "")
     if not refresh_token:
         return False
-
     try:
         resp = requests.post(
             _TOKEN_URL,
@@ -180,16 +198,12 @@ def refresh_codex_token() -> bool:
         data = resp.json()
         if "access_token" not in data:
             return False
-
-        # Merge: keep existing tokens, overwrite with new ones
         existing = auth.get("tokens", {})
-        existing.update({
-            "access_token":  data["access_token"],
-            "id_token":      data.get("id_token", existing.get("id_token", "")),
-        })
+        existing["access_token"] = data["access_token"]
+        if "id_token" in data:
+            existing["id_token"] = data["id_token"]
         if "refresh_token" in data:
             existing["refresh_token"] = data["refresh_token"]
-
         auth["tokens"]       = existing
         auth["last_refresh"] = int(time.time())
         _CODEX_AUTH.write_text(json.dumps(auth, indent=2))
@@ -198,64 +212,79 @@ def refresh_codex_token() -> bool:
         return False
 
 
-# ── Interactive login (used by configure wizard) ──────────────────────
+# ── Interactive login ─────────────────────────────────────────────────
 
 def interactive_login(print_fn=print) -> bool:
     """
-    Full interactive Device Code login flow.
-    print_fn: callable for output (default print).
+    Full interactive Authorization Code + PKCE login.
+    VPS mode: user opens URL in local browser, pastes redirect URL back.
     Returns True on success.
     """
-    print_fn("\n⏳ Запрашиваю код авторизации...")
+    auth_url, state, verifier = build_auth_url()
+
+    print_fn("\n" + "=" * 60)
+    print_fn("  Открой эту ссылку в ЛОКАЛЬНОМ браузере:")
+    print_fn()
+    print_fn(f"  {auth_url}")
+    print_fn()
+    print_fn("  После входа браузер перейдёт на localhost:1455.")
+    print_fn("  Если страница не открылась — скопируй ПОЛНЫЙ URL")
+    print_fn("  из адресной строки и вставь ниже.")
+    print_fn("=" * 60 + "\n")
+
+    # Try catching locally first (if browser is on same machine)
+    code = _try_local_server(timeout=3)
+
+    if code:
+        print_fn("  ✓ Код получен автоматически.")
+    else:
+        # VPS mode: ask user to paste the redirect URL
+        try:
+            raw = input("  Вставь URL из браузера (или Enter для отмены): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print_fn("\n  Отменено.")
+            return False
+
+        if not raw:
+            print_fn("  Отменено.")
+            return False
+
+        try:
+            code, returned_state = _parse_redirect_url(raw)
+        except ValueError as e:
+            print_fn(f"  ❌ {e}")
+            return False
+
+        if returned_state and returned_state != state:
+            print_fn("  ❌ State mismatch — возможна CSRF атака. Повтори вход.")
+            return False
+
+    print_fn("  Обмениваю код на токены...", end="", flush=True)
     try:
-        info = device_auth_start()
+        tokens = exchange_code(code, verifier)
     except RuntimeError as e:
-        print_fn(f"❌ {e}")
-        return False
-
-    user_code   = info.get("user_code", "?")
-    expires_in  = info.get("expires_in", 300)
-    interval    = info.get("interval", 5)
-    device_code = info["device_code"]
-    verifier    = info["_verifier"]
-
-    print_fn(f"\n{'='*50}")
-    print_fn(f"  Открой в браузере: {_VERIFY_URL}")
-    print_fn(f"  Введи код:         {user_code}")
-    print_fn(f"{'='*50}")
-    print_fn(f"  Код действителен {expires_in // 60} минут.\n")
-
-    def _tick(elapsed: int):
-        print_fn(f"  ⏳ Ожидаю подтверждения... ({elapsed}с)")
-
-    try:
-        tokens = device_auth_poll(
-            device_code, verifier,
-            interval=interval, timeout=expires_in,
-            on_waiting=_tick,
-        )
-    except RuntimeError as e:
-        print_fn(f"❌ {e}")
+        print_fn(f"\n  ❌ {e}")
         return False
 
     save_codex_auth(tokens)
-    print_fn("\n✅ Авторизация успешна! Токен сохранён в ~/.codex/auth.json")
+    has_id = "✓" if tokens.get("id_token") else "✗"
+    print_fn(f"\n  ✅ Авторизация успешна!")
+    print_fn(f"     access_token: ✓  refresh_token: ✓  id_token: {has_id}")
+    print_fn(f"     Сохранено в: {_CODEX_AUTH}\n")
     return True
 
 
 def codex_login_status() -> str:
-    """Returns human-readable login status string."""
     auth = load_codex_auth()
     if not auth:
-        return "Не авторизован (auth.json отсутствует)"
+        return "Не авторизован"
     tokens = auth.get("tokens", {})
     if not tokens.get("access_token"):
         return "Не авторизован (access_token пуст)"
     last = auth.get("last_refresh", 0)
+    age_str = ""
     if last:
         age = int(time.time()) - last
-        age_str = f", обновлён {age // 3600}ч {(age % 3600) // 60}м назад"
-    else:
-        age_str = ""
+        age_str = f", {age // 3600}ч {(age % 3600) // 60}м назад"
     has_id = "✓" if tokens.get("id_token") else "✗"
     return f"Авторизован (id_token: {has_id}{age_str})"
