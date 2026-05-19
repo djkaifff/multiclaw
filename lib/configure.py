@@ -153,6 +153,10 @@ def _edit_bot_wizard(bot_name: str):
 
     cfg = state.get_config(bot_name)
 
+    from lib.codex_auth import codex_login_status as _cls
+    _codex_status = _cls()
+    _codex_label  = f"  Codex CLI авторизация  [{_codex_status}]"
+
     action = questionary.select(
         "Что настроить?",
         choices=[
@@ -162,6 +166,7 @@ def _edit_bot_wizard(bot_name: str):
             questionary.Choice("  Скиллы",           value="skills"),
             questionary.Choice("  Soul (личность)",  value="soul"),
             questionary.Choice("  Heartbeat (CRON)", value="heartbeat"),
+            questionary.Choice(_codex_label,         value="codex_login"),
             questionary.Separator(),
             questionary.Choice("  ▶ Запустить бота", value="start"),
             questionary.Choice("  ■ Остановить бота",value="stop"),
@@ -196,6 +201,9 @@ def _edit_bot_wizard(bot_name: str):
         cfg["skills"] = skills_cfg
         state.save_config(bot_name, cfg)
         print("  ✓ Скиллы сохранены.\n")
+
+    elif action == "codex_login":
+        _run_codex_login_wizard()
 
     elif action == "soul":
         _edit_soul(bot_name)
@@ -272,6 +280,9 @@ def _setup_model_wizard(bot_name: str) -> dict | None:
         api_type        = p["api_type"]
         base_url        = p.get("base_url", "")
         provider_models = p["models"]
+        # codex-cli: check/refresh auth
+        if api_type == "codex-cli":
+            _ensure_codex_login()
     elif selection["type"] == "new_cli":
         provider_id     = selection["provider_id"]
         p               = selection["data"]
@@ -279,6 +290,9 @@ def _setup_model_wizard(bot_name: str) -> dict | None:
         base_url        = p.get("base_url", "")
         api_key         = provider_id   # sentinel — no real key needed
         provider_models = p["models"]
+        # codex-cli: check/refresh auth
+        if api_type == "codex-cli":
+            _ensure_codex_login()
     else:
         provider_id     = selection["provider_id"]
         p               = selection["data"]
@@ -767,3 +781,61 @@ def _print_summary(bot_name: str, cfg: dict):
     sk = cfg.get("skills", {}).get("_enabled", [])
     print(f"  Скиллы   : {', '.join(sk) if sk else '○ не выбраны'}")
     print()
+
+
+# ── Codex auth helpers ────────────────────────────────────────────────
+
+def _ensure_codex_login():
+    """Called when user picks codex-cli provider. Warns/prompts if not logged in."""
+    from lib.codex_auth import is_codex_logged_in, codex_login_status
+
+    status = codex_login_status()
+    print(f"\n  Codex статус: {status}")
+
+    if is_codex_logged_in():
+        return
+
+    print("  \033[33m⚠  Codex CLI не авторизован.\033[0m")
+    do_login = questionary.confirm(
+        "Войти в Codex CLI сейчас? (откроется браузер)",
+        default=True, style=STYLE,
+    ).ask()
+
+    if do_login:
+        _run_codex_login_wizard()
+    else:
+        print("  ⚠  Без авторизации codex-cli не будет работать. Войди позже через меню.\n")
+
+
+def _run_codex_login_wizard():
+    """Full interactive Device Code login flow."""
+    from lib.codex_auth import interactive_login, codex_login_status, refresh_codex_token, is_codex_logged_in
+
+    # Offer refresh if already logged in
+    if is_codex_logged_in():
+        print(f"\n  Текущий статус: {codex_login_status()}")
+        action = questionary.select(
+            "Что сделать?",
+            choices=[
+                questionary.Choice("  Обновить access_token (refresh)",    value="refresh"),
+                questionary.Choice("  Войти заново (новый Device Code)",   value="login"),
+                questionary.Choice("  ← Отмена",                           value=None),
+            ],
+            style=STYLE,
+        ).ask()
+
+        if action is None:
+            return
+        elif action == "refresh":
+            print("  Обновляю токен...", end="", flush=True)
+            ok = refresh_codex_token()
+            if ok:
+                print(f" \033[32m✓ Токен обновлён.\033[0m")
+            else:
+                print(f" \033[33m⚠ Refresh не удался — войди заново.\033[0m")
+                action = "login"
+
+        if action != "login":
+            return
+
+    interactive_login(print_fn=print)

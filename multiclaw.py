@@ -7,6 +7,8 @@ Usage:
   multiclaw stop <name>     — stop a bot
   multiclaw status          — show all bots status
   multiclaw run <name>      — run bot loop (used internally by start)
+  multiclaw codex-login     — authenticate Codex CLI via Device Code (browser)
+  multiclaw codex-status    — show Codex CLI auth status
 """
 import sys
 import os
@@ -44,6 +46,14 @@ def main():
             sys.exit(1)
         from lib.runner import run_bot
         run_bot(args[1])
+
+    elif cmd == "codex-login":
+        from lib.codex_auth import interactive_login
+        interactive_login()
+
+    elif cmd == "codex-status":
+        from lib.codex_auth import codex_login_status
+        print(codex_login_status())
 
     elif cmd in ("--help", "-h", "help"):
         print(__doc__)

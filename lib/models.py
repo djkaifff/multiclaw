@@ -244,37 +244,18 @@ def call_model(model_cfg: dict, messages: list[dict],
 
 # ── Provider implementations ─────────────────────────────────────────
 
-def _call_claude_cli(model_id: str, system: str, messages: list[dict]) -> str:
-    parts = []
-    if system:
-        parts.append(system)
-    for m in messages:
-        if m["role"] == "user":
-            parts.append(m["content"])
-        elif m["role"] == "assistant":
-            parts.append(f"[assistant]: {m['content']}")
-    prompt = "\n\n".join(parts)
-
-    clean_env = {
-        k: v for k, v in os.environ.items()
-        if k not in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
-                     "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT")
-    }
-    result = subprocess.run(
-        ["claude", "-p", prompt,
-         "--model", model_id,
-         "--output-format", "text",
-         "--no-session-persistence"],
-        capture_output=True, text=True, timeout=120,
-        stdin=subprocess.DEVNULL, env=clean_env,
-    )
-    if result.returncode != 0 and result.stderr:
-        raise RuntimeError(result.stderr[:200])
-    return result.stdout.strip()
-
-
 def _call_codex_cli(model_id: str, system: str, messages: list[dict]) -> str:
     import tempfile, os as _os
+    from lib.codex_auth import is_codex_logged_in, refresh_codex_token
+
+    # Auto-refresh if logged in but token may be stale (best-effort)
+    if not is_codex_logged_in():
+        raise RuntimeError(
+            "Codex CLI не авторизован. Войди через: multiclaw codex-login"
+        )
+    # Try refresh silently (ignore failures — codex itself will surface auth errors)
+    refresh_codex_token()
+
     parts = []
     if system:
         parts.append(system)
@@ -308,6 +289,35 @@ def _call_codex_cli(model_id: str, system: str, messages: list[dict]) -> str:
         return result.stdout.strip()
     finally:
         _os.unlink(out_path)
+
+
+def _call_claude_cli(model_id: str, system: str, messages: list[dict]) -> str:
+    parts = []
+    if system:
+        parts.append(system)
+    for m in messages:
+        if m["role"] == "user":
+            parts.append(m["content"])
+        elif m["role"] == "assistant":
+            parts.append(f"[assistant]: {m['content']}")
+    prompt = "\n\n".join(parts)
+
+    clean_env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
+                     "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_EFFORT")
+    }
+    result = subprocess.run(
+        ["claude", "-p", prompt,
+         "--model", model_id,
+         "--output-format", "text",
+         "--no-session-persistence"],
+        capture_output=True, text=True, timeout=120,
+        stdin=subprocess.DEVNULL, env=clean_env,
+    )
+    if result.returncode != 0 and result.stderr:
+        raise RuntimeError(result.stderr[:200])
+    return result.stdout.strip()
 
 
 def _call_gemini_cli(model_id: str, system: str, messages: list[dict]) -> str:
