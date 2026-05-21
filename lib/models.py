@@ -107,17 +107,11 @@ CLI_PROVIDERS = {
         "api_key": "codex-cli",
         "cli_bin": "codex",
         "models": [
-            {"id": "gpt-5.5-pro",  "name": "GPT-5.5 Pro",   "tags": "powerful · latest"},
-            {"id": "gpt-5.5",      "name": "GPT-5.5",        "tags": "powerful"},
-            {"id": "gpt-5.4-pro",  "name": "GPT-5.4 Pro",   "tags": "powerful"},
-            {"id": "gpt-5.4",      "name": "GPT-5.4",        "tags": "powerful"},
-            {"id": "gpt-5.4-mini", "name": "GPT-5.4 Mini",  "tags": "fast · cheap"},
-            {"id": "gpt-5.4-nano", "name": "GPT-5.4 Nano",  "tags": "fast · cheapest"},
-            {"id": "o4-mini",      "name": "o4-mini",        "tags": "reasoning · fast"},
-            {"id": "o3",           "name": "o3",             "tags": "reasoning · powerful"},
-            {"id": "o3-pro",       "name": "o3 Pro",         "tags": "reasoning · max"},
-            {"id": "gpt-4o",       "name": "GPT-4o",         "tags": "multimodal"},
-            {"id": "gpt-4o-mini",  "name": "GPT-4o Mini",   "tags": "multimodal · cheap"},
+            # Verified working with ChatGPT Plus/Pro account (tested May 2026)
+            {"id": "gpt-5.4",       "name": "GPT-5.4",        "tags": "powerful · latest"},
+            {"id": "gpt-5.4-mini",  "name": "GPT-5.4 Mini",  "tags": "fast · balanced"},
+            {"id": "gpt-5.3-codex", "name": "GPT-5.3 Codex", "tags": "coding · fast"},
+            {"id": "gpt-5.2",       "name": "GPT-5.2",        "tags": "stable"},
         ],
     },
     "gemini-cli": {
@@ -298,6 +292,18 @@ def _call_codex_cli(model_id: str, system: str, messages: list[dict]) -> str:
             cmd, capture_output=True, text=True, timeout=120,
             stdin=subprocess.DEVNULL, cwd="/tmp",
         )
+        # Errors from codex come as ERROR: {...} lines in stdout
+        import re as _re
+        for line in result.stdout.splitlines():
+            if line.startswith("ERROR:"):
+                try:
+                    import json as _json
+                    err = _json.loads(line[6:].strip())
+                    msg = err.get("error", {}).get("message", line)
+                except Exception:
+                    msg = line[6:].strip()
+                raise RuntimeError(msg[:300])
+
         output = open(out_path).read().strip()
         if output:
             return output
