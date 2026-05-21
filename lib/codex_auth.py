@@ -155,7 +155,7 @@ def save_codex_auth(tokens: dict):
             "id_token":      tokens.get("id_token", ""),
         },
         "last_refresh": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "auth_mode":    "oauth",
+        "auth_mode":    "chatgptAuthTokens",
     }
     _CODEX_AUTH.write_text(json.dumps(payload, indent=2))
     _CODEX_AUTH.chmod(0o600)
