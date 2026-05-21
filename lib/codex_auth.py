@@ -10,6 +10,7 @@ import json
 import os
 import secrets
 import time
+from datetime import datetime, timezone
 import threading
 import urllib.parse
 from pathlib import Path
@@ -153,7 +154,7 @@ def save_codex_auth(tokens: dict):
             "refresh_token": tokens.get("refresh_token", ""),
             "id_token":      tokens.get("id_token", ""),
         },
-        "last_refresh": int(time.time()),
+        "last_refresh": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "auth_mode":    "oauth",
     }
     _CODEX_AUTH.write_text(json.dumps(payload, indent=2))
@@ -205,7 +206,7 @@ def refresh_codex_token() -> bool:
         if "refresh_token" in data:
             existing["refresh_token"] = data["refresh_token"]
         auth["tokens"]       = existing
-        auth["last_refresh"] = int(time.time())
+        auth["last_refresh"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         _CODEX_AUTH.write_text(json.dumps(auth, indent=2))
         return True
     except Exception:
@@ -281,10 +282,14 @@ def codex_login_status() -> str:
     tokens = auth.get("tokens", {})
     if not tokens.get("access_token"):
         return "Не авторизован (access_token пуст)"
-    last = auth.get("last_refresh", 0)
+    last = auth.get("last_refresh", "")
     age_str = ""
     if last:
-        age = int(time.time()) - last
-        age_str = f", {age // 3600}ч {(age % 3600) // 60}м назад"
+        try:
+            ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            age = int(time.time()) - int(ts.timestamp())
+            age_str = f", {age // 3600}ч {(age % 3600) // 60}м назад"
+        except Exception:
+            pass
     has_id = "✓" if tokens.get("id_token") else "✗"
     return f"Авторизован (id_token: {has_id}{age_str})"
